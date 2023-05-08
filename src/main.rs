@@ -1,11 +1,11 @@
+use chrono::{Datelike, Local};
 use hashbrown::HashMap;
 use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::channel;
-use std::thread;
-//use threadpool::ThreadPool;
+use threadpool::ThreadPool;
 
 mod cli_args;
 use cli_args::Args;
@@ -218,49 +218,13 @@ fn main() {
     let opt = Args::parse();
     let repo_root = git_repo_root(&opt.path).expect("Not a git repo");
 
-    let dates = match &opt.date {
-        Some(d) => vec![d.clone()],
-        None => vec![
-            //"2016-04-01",
-            //"2017-04-01",
-            //"2018-04-01",
-            //"2019-04-01",
-            //"2020-04-01",
-            //"2021-04-01",
-            //"2022-04-01",
-            //"2023-04-01",
-
-            "2016-04-01",
-            "2016-07-01",
-            "2016-10-01",
-            "2017-01-01",
-            "2017-04-01",
-            "2017-07-01",
-            "2017-10-01",
-            "2018-01-01",
-            "2018-04-01",
-            "2018-07-01",
-            "2018-10-01",
-            "2019-01-01",
-            "2019-04-01",
-            "2019-07-01",
-            "2019-10-01",
-            "2020-01-01",
-            "2020-04-01",
-            "2020-07-01",
-            "2020-10-01",
-            "2021-01-01",
-            "2021-04-01",
-            "2021-07-01",
-            "2021-10-01",
-            "2022-01-01",
-            "2022-04-01",
-            "2022-07-01",
-            "2022-10-01",
-            "2023-01-01",
-            "2023-04-01",
-        ].iter().map(|x| x.to_string()).collect(),
-    };
+    let mut dates = Vec::new();
+    let dt = Local::now();
+    for year in 2016..=dt.year() {
+        for month in 1..=12 {
+            dates.push(format!("{year:4}-{month:02}-01"));
+        }
+    }
 
     // HashMap<date, HashMap<name, count>>
     let mut authors = AuthorPerformance::new();
@@ -277,41 +241,26 @@ fn main() {
                 true
             }
         }).map(|x| x.to_string()).collect();
-        println!("{}", files.len());
         if files.len() == 0 { continue; }
 
-        let mut handles = Vec::new();
+        let pool = ThreadPool::new(files.len().min(16)); // TODO: make this configurable, default to # of cores
         let (tx, rx) = channel();
         for f in files.iter() {
             let trepo_root = repo_root.clone();
             let trevision = revision.clone();
             let tf = f.clone();
             let ttx = tx.clone();
-            handles.push(thread::spawn(move || {
-                //let start = Instant::now();
-                let fauth = git_author_line_count(&trepo_root, &trevision, &tf);
-                ttx.send(fauth).unwrap();
-                //println!("{}ms", start.elapsed().as_millis());
-            }));
+            pool.execute(move || {
+                ttx.send(git_author_line_count(&trepo_root, &trevision, &tf)).unwrap();
+            });
         };
 
         let mut dauth = AuthorCount::new();
-        let mut pending = handles.len();
-        loop {
-            match rx.recv() {
-                Err(_) => break,
-                Ok(fauth) => {
-                    fauth.iter().for_each(|(author, count)| {
-                        *dauth.entry_ref(author).or_insert(0) += count;
-                    });
-                    pending -= 1;
-                    if pending == 0 { break; }
-                },
-            }
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        rx.iter().take(files.len()).for_each(|fauth| {
+            fauth.iter().for_each(|(author, count)| {
+                *dauth.entry_ref(author).or_insert(0) += count;
+            });
+        });
 
         let date_str = date.to_string();
         authors.insert(date_str, dauth);
