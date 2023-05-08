@@ -3,6 +3,9 @@ use lazy_static::lazy_static;
 use regex::Regex;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::mpsc::channel;
+use std::thread;
+//use threadpool::ThreadPool;
 
 mod cli_args;
 use cli_args::Args;
@@ -32,20 +35,24 @@ fn git_repo_root(path: &str) -> Option<String> {
 }
 
 fn git_revision(repo_root: &str, branch: &Option<String>, date: &Option<String>) -> Option<String> {
+    //println!("repo_root: {repo_root}");
+    //println!("branch: {branch:?}");
+    //println!("date: {date:?}");
     // git log --format=format:"%H" --before=2023-01-01
     let mut cmd = Command::new("git");
     cmd.arg("log");
-    if let Some(branch) = branch {
-        cmd.arg(branch);
-    }
     cmd.arg("-n1").arg("--format=format:%H");
     if let Some(date) = date {
         cmd.arg(format!("--before={date}"));
     }
-    let cmd_out = cmd
-                .current_dir(repo_root)
-                .output()
-                .expect("git log failed to start");
+    if let Some(branch) = branch {
+       cmd.arg(branch);
+    }
+    cmd.current_dir(repo_root);
+    //println!("cmd: {:?}", cmd);
+    let cmd_out = cmd.output().expect("git log failed to start");
+    //println!("{:?}", cmd_out.status);
+    //println!("{:?}", cmd_out.stdout);
     match cmd_out.status.success() {
         false => return None,
         true => {
@@ -273,13 +280,38 @@ fn main() {
         println!("{}", files.len());
         if files.len() == 0 { continue; }
 
+        let mut handles = Vec::new();
+        let (tx, rx) = channel();
+        for f in files.iter() {
+            let trepo_root = repo_root.clone();
+            let trevision = revision.clone();
+            let tf = f.clone();
+            let ttx = tx.clone();
+            handles.push(thread::spawn(move || {
+                //let start = Instant::now();
+                let fauth = git_author_line_count(&trepo_root, &trevision, &tf);
+                ttx.send(fauth).unwrap();
+                //println!("{}ms", start.elapsed().as_millis());
+            }));
+        };
+
         let mut dauth = AuthorCount::new();
-        files.iter().for_each(|f| {
-            let fauth = git_author_line_count(&repo_root, &revision, f);
-            fauth.iter().for_each(|(author, count)| {
-                *dauth.entry_ref(author).or_insert(0) += count;
-            });
-        });
+        let mut pending = handles.len();
+        loop {
+            match rx.recv() {
+                Err(_) => break,
+                Ok(fauth) => {
+                    fauth.iter().for_each(|(author, count)| {
+                        *dauth.entry_ref(author).or_insert(0) += count;
+                    });
+                    pending -= 1;
+                    if pending == 0 { break; }
+                },
+            }
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
 
         let date_str = date.to_string();
         authors.insert(date_str, dauth);
