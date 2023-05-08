@@ -8,6 +8,12 @@ mod cli_args;
 use cli_args::Args;
 use clap::Parser;
 
+type Author = String;
+type Date = String;
+type Count = i32;
+type AuthorCount = HashMap<Author, Count>;
+type AuthorPerformance = HashMap<Date, AuthorCount>;
+
 fn git_repo_root(path: &str) -> Option<String> {
     let repo_root_out =
         Command::new("git")
@@ -87,7 +93,16 @@ fn reason_to_skip(path_buf: &PathBuf) -> Option<String> {
         "edif",
         "edf",
         "rpt",
+        "xci",
     ];
+
+    let path = path_buf.to_str().unwrap();
+    if path.starts_with("xip/") {
+        return Some("mostly imported     ".to_string());
+    }
+    if path.starts_with("cache/") {
+        return Some("generated           ".to_string());
+    }
 
     if let Some(ext) = path_buf.extension() {
         let ext = ext.to_str().unwrap();
@@ -106,16 +121,11 @@ fn reason_to_skip(path_buf: &PathBuf) -> Option<String> {
         }
     }
 
-    let path = path_buf.to_str().unwrap();
-    if path.contains("xip/") {
-        return Some("mostly imported     ".to_string());
-    }
-
     return None;
 }
 
-fn git_author_line_count_hash(repo_root: &str, revision: &str, file_path: &str) -> HashMap<String, i32> {
-    let mut authors = HashMap::<String, i32>::new();
+fn git_author_line_count(repo_root: &str, revision: &str, file_path: &str) -> AuthorCount {
+    let mut authors = AuthorCount::new();
 
     let blame_out =
         Command::new("git")
@@ -135,118 +145,147 @@ fn git_author_line_count_hash(repo_root: &str, revision: &str, file_path: &str) 
     return authors;
 }
 
-fn _git_author_line_count_vec(repo_root: &str, revision: &str, file_path: &str) -> Vec<(String, i32)> {
-    let mut authors = Vec::<(String, i32)>::new();
-
-    let blame_out =
-        Command::new("git")
-                .arg("blame")
-                .arg("--line-porcelain")
-                .arg(revision)
-                .arg(file_path)
-                .current_dir(repo_root)
-                .output()
-                .expect("git blame failed to start");
-    let auth_lines = String::from_utf8_lossy(&blame_out.stdout);
-    auth_lines.lines().filter(|x| x.starts_with("author ")).for_each(|x| {
-        let author = x[7..].to_string();
-        match authors.iter().position(|x| x.0 == author) {
-            Some(ii) => authors[ii].1 += 1,
-            None => {
-                authors.push((author.to_string(), 1));
-            },
-        }
-    });
-
-    return authors;
-}
-
-fn reformat(authors: &HashMap<String, i32>) -> HashMap<String, i32> {
+fn reformat(perf: &AuthorPerformance) -> AuthorPerformance {
     lazy_static! {
         // Regex for reformatting author names
         static ref RE_SPECIAL: Regex = Regex::new(r"[-_\.]").unwrap();
         static ref RE_CAPITAL: Regex = Regex::new(r"\b[a-z]").unwrap();
     };
 
-    let mut formatted = HashMap::<String, i32>::new();
+    let mut formatted = AuthorPerformance::new();
 
-    authors.iter().for_each(|(author, count)| {
-        // reformat author name
-        let auth = RE_SPECIAL.replace_all(&author, " ").to_lowercase();
-        let mut author = auth.clone();
-        for mat in RE_CAPITAL.find_iter(&auth) {
-            let mut c = author.chars().nth(mat.start()).unwrap();
-            c = c.to_uppercase().nth(0).unwrap();
-            author.replace_range(mat.start()..mat.start()+1, &c.to_string());
+    perf.iter().for_each(|(date, acnt_in)| {
+        let acnt_out = formatted.entry_ref(date).or_insert(AuthorCount::new());
+        for author in acnt_in.keys() {
+            let cnt_in = acnt_in[author];
+            // reformat author name
+            let mut author = RE_SPECIAL.replace_all(&author, " ").to_lowercase();
+            for mat in RE_CAPITAL.find_iter(&author.clone()) {
+                let mut c = author.chars().nth(mat.start()).unwrap();
+                c = c.to_uppercase().nth(0).unwrap();
+                author.replace_range(mat.start()..mat.start()+1, &c.to_string());
+            }
+
+            *acnt_out.entry_ref(&author).or_insert(0) += cnt_in;
         }
-        *formatted.entry_ref(&author).or_insert(0) += count;
     });
 
     return formatted;
 }
 
-fn display_results(opt: &Args, authors: &HashMap<String, i32>, skip_files: i32, use_files: i32) {
-    let long_auth = authors.keys().map(|x| x.len()).max().unwrap_or(0);
-    let line_tot = authors.values().fold(0, |acc, x| acc + x);
+fn display_results(_opt: &Args, perf: &AuthorPerformance) { //, skip_files: i32, use_files: i32) {
+    let perf = reformat(&perf);
 
-    //let mut mauthors = authors.to_owned();
-    let mut auth_vec: Vec<(String, i32)> = authors.keys().map(|x| (x.to_string(), authors[x])).collect();
-    if opt.alphabetical {
-        auth_vec.sort_by(|a, b| a.0.cmp(&b.0));
-    } else {
-        auth_vec.sort_by(|a, b| b.1.cmp(&a.1));
-    }
-    let auth_vec = auth_vec;
+    let mut dates = perf.keys().map(|x| x.to_string()).collect::<Vec<String>>();
+    dates.sort();
 
-    println!("Files used: {}, Files skipped: {}, lines counted: {}", use_files, skip_files, line_tot);
-    for (author, count) in auth_vec {
-        let count_str = match opt.as_percent {
-            true => format!("{:>4.1}%", (100.0_f64 * count as f64) / (line_tot as f64)),
-            false => format!("{}", count),
-        };
-        println!("{author:<long_auth$}: {count_str}");
+    let mut authors = Vec::new();
+    for date in &dates {
+        if let Some(acnt) = perf.get(date) {
+            authors.extend(acnt.keys().map(|x| x.to_string()));
+        }
     }
+    authors.sort();
+    authors.dedup();
+    let long_auth = authors.iter().map(|x| x.len()).max().unwrap_or(0);
+
+    print!("{:<long_auth$}, ", "date");
+    for date in &dates {
+       print!("{:>10}, ", date);
+    }
+    println!();
+
+    for author in authors {
+        print!("{author:<long_auth$}, ");
+        for date in &dates {
+            if let Some(acnt) = perf.get(date) {
+                print!("{:>10}, ", acnt.get(&author).unwrap_or(&0));
+            }
+        }
+        println!();
+    };
+    println!();
 }
 
 fn main() {
     let opt = Args::parse();
-
     let repo_root = git_repo_root(&opt.path).expect("Not a git repo");
-    let revision = git_revision(&repo_root, &opt.branch, &opt.date).expect("Failed to get revision from branch and date");
-    let files = git_files(&repo_root, &revision);
 
-    let mut skip_files = 0_i32;
-    let mut use_files = 0_i32;
-    let files = files.iter().filter(|f| {
-        let pb = PathBuf::from(&f);
-        if let Some(reason) = reason_to_skip(&pb) {
-            skip_files += 1;
-            if opt.show_excluded {
-                println!("Skipping b/c {reason}: {}", &f);
+    let dates = match &opt.date {
+        Some(d) => vec![d.clone()],
+        None => vec![
+            //"2016-04-01",
+            //"2017-04-01",
+            //"2018-04-01",
+            //"2019-04-01",
+            //"2020-04-01",
+            //"2021-04-01",
+            //"2022-04-01",
+            //"2023-04-01",
+
+            "2016-04-01",
+            "2016-07-01",
+            "2016-10-01",
+            "2017-01-01",
+            "2017-04-01",
+            "2017-07-01",
+            "2017-10-01",
+            "2018-01-01",
+            "2018-04-01",
+            "2018-07-01",
+            "2018-10-01",
+            "2019-01-01",
+            "2019-04-01",
+            "2019-07-01",
+            "2019-10-01",
+            "2020-01-01",
+            "2020-04-01",
+            "2020-07-01",
+            "2020-10-01",
+            "2021-01-01",
+            "2021-04-01",
+            "2021-07-01",
+            "2021-10-01",
+            "2022-01-01",
+            "2022-04-01",
+            "2022-07-01",
+            "2022-10-01",
+            "2023-01-01",
+            "2023-04-01",
+        ].iter().map(|x| x.to_string()).collect(),
+    };
+
+    // HashMap<date, HashMap<name, count>>
+    let mut authors = AuthorPerformance::new();
+
+    for date in dates.iter() {
+        let revision = git_revision(&repo_root, &opt.branch, &Some(date.to_string())).expect("Failed to get revision from branch and date");
+        let files = git_files(&repo_root, &revision);
+
+        let files: Vec<String> = files.iter().filter(|f| {
+            let pb = PathBuf::from(&f);
+            if let Some(_) = reason_to_skip(&pb) {
+                false
+            } else {
+                true
             }
-            false
-        } else {
-            use_files += 1;
-            true
-        }
-    });
+        }).map(|x| x.to_string()).collect();
+        println!("{}", files.len());
+        if files.len() == 0 { continue; }
 
-    //let mut authors = Vec::<(String, i32)>::new(); // Vec of tuples instead of HashMap because it is faster for small sizes 
-    let mut authors = HashMap::<String, i32>::new();
-
-    for f in files {
-        let lauth = git_author_line_count_hash(&repo_root, &revision, f);
-        lauth.iter().for_each(|(author, count)| {
-            *authors.entry_ref(author).or_insert(0) += count;
+        let mut dauth = AuthorCount::new();
+        files.iter().for_each(|f| {
+            let fauth = git_author_line_count(&repo_root, &revision, f);
+            fauth.iter().for_each(|(author, count)| {
+                *dauth.entry_ref(author).or_insert(0) += count;
+            });
         });
-    }
-    let authors = authors;
 
-    //------ Reformat author names
+        let date_str = date.to_string();
+        authors.insert(date_str, dauth);
+    };
 
-    let authors = reformat(&authors);
-
-    display_results(&opt, &authors, skip_files, use_files);
+    display_results(&opt, &authors);//, skip_files, use_files);
 }
 
 
