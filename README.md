@@ -1,3 +1,9 @@
+### Example Run
+
+![Example run](doc/example_run.png)
+
+Copy/paste into python, excel, whatever, then plot
+
 ### TODO
 
 * Threadpool around each "git blame" call, or maybe around each date
